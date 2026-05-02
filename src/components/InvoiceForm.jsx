@@ -1,5 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import emailjs from '@emailjs/browser';
 import { generatePDF } from '../utils/generatePDF';
+import html2pdf from 'html2pdf.js';
+
+// ─── EmailJS credentials — replace before deploying ───────────────────────────
+const YOUR_SERVICE_ID = 'service_6oqpd3q';
+const YOUR_TEMPLATE_ID = 'template_zcmvdes';
+const YOUR_PUBLIC_KEY = 'wcYJCzIcZVwjpDXTd';
+// ──────────────────────────────────────────────────────────────────────────────
 
 const CURRENCIES = [
   { symbol: '₹', label: 'INR (₹)' },
@@ -17,14 +25,30 @@ const defaultItem = () => ({ description: '', quantity: 1, price: 0 });
 
 const InvoiceForm = ({ data, onChange }) => {
   const [pdfLoading, setPdfLoading] = useState(false);
+
+  // ── Email modal state ──────────────────────────────────────────────────────
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailMsg, setEmailMsg] = useState('');
+  const [emailLoading, setEmailLoading] = useState(false);
+  const [toast, setToast] = useState(null); // { type: 'success'|'error', text: string }
+
+  // ── Cash Tendered state (local only, resets on form reset) ─────────────────
+  const [cashGiven, setCashGiven] = useState('');
+  const cashInputRef = useRef(null);
+
   const { from, to, invoice, items, tax, discount, notes, currency } = data;
 
-  const update = (section, field, value) => {
-    onChange({ ...data, [section]: { ...data[section], [field]: value } });
+  // Pre-fill email modal whenever it opens
+  const openEmailModal = () => {
+    setEmailTo(to.email || '');
+    setEmailMsg('');
+    setShowEmailModal(true);
   };
 
+  const update = (section, field, value) =>
+    onChange({ ...data, [section]: { ...data[section], [field]: value } });
   const updateRoot = (field, value) => onChange({ ...data, [field]: value });
-
   const updateItem = (idx, field, value) => {
     const next = items.map((item, i) =>
       i === idx ? { ...item, [field]: value } : item
@@ -33,7 +57,6 @@ const InvoiceForm = ({ data, onChange }) => {
   };
 
   const addItem = () => onChange({ ...data, items: [...items, defaultItem()] });
-
   const removeItem = (idx) => {
     if (items.length === 1) return;
     onChange({ ...data, items: items.filter((_, i) => i !== idx) });
@@ -45,8 +68,190 @@ const InvoiceForm = ({ data, onChange }) => {
   const total = subtotal - discountAmt + taxAmt;
   const fmt = v => `${currency}${Number(v).toFixed(2)}`;
 
+  // ── Toast auto-dismiss ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // ── Cash change calculation ────────────────────────────────────────────────
+  const cashVal = parseFloat(cashGiven);
+  const hasCash = cashGiven !== '' && !isNaN(cashVal);
+  const change = hasCash ? cashVal - total : 0;
+  const cashStatus = hasCash
+    ? change >= 0
+      ? { ok: true, text: `✅ Change to Return: ${fmt(change)}` }
+      : { ok: false, text: `❌ Insufficient: ${fmt(Math.abs(change))} short` }
+    : null;
+
+  // ── Send Invoice via EmailJS ───────────────────────────────────────────────
+  // EmailJS free plan cap: ~50 KB per message.
+  // Strategy: generate a compressed PDF, check size, compress harder if needed,
+  // and omit the attachment (sending details only) if it still won't fit.
+  const EMAILJS_BYTE_LIMIT = 45000; // conservative 45 KB to stay safely under 50 KB
+
+  const buildPdfBase64 = async (scale, quality) => {
+    const element = document.getElementById('invoice-print-area');
+    const opt = {
+      margin: 4,
+      image: { type: 'jpeg', quality },
+      html2canvas: { scale, useCORS: true, letterRendering: true },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    };
+    const dataUri = await html2pdf().set(opt).from(element).outputPdf('datauristring');
+    return dataUri.replace(/^data:application\/pdf;base64,/, '');
+  };
+
+  const handleSendEmail = async () => {
+    if (!emailTo.trim()) {
+      setToast({ type: 'error', text: 'Please enter a recipient email address.' });
+      return;
+    }
+
+    const element = document.getElementById('invoice-print-area');
+    if (!element) {
+      setToast({ type: 'error', text: 'Invoice preview not found. Please fill in at least one field.' });
+      return;
+    }
+
+    setEmailLoading(true);
+    try {
+      // Pass 1: moderate compression (scale 1, quality 0.6)
+      let pdfBase64 = await buildPdfBase64(1, 0.6);
+      let sizeBytes = Math.ceil((pdfBase64.length * 3) / 4);
+      let attachmentDropped = false;
+
+      // Pass 2: heavy compression (scale 0.75, quality 0.4)
+      if (sizeBytes > EMAILJS_BYTE_LIMIT) {
+        pdfBase64 = await buildPdfBase64(0.75, 0.4);
+        sizeBytes = Math.ceil((pdfBase64.length * 3) / 4);
+      }
+
+      // If still too large, send without attachment
+      if (sizeBytes > EMAILJS_BYTE_LIMIT) {
+        pdfBase64 = '';
+        attachmentDropped = true;
+      }
+
+      await emailjs.send(
+        YOUR_SERVICE_ID,
+        YOUR_TEMPLATE_ID,
+        {
+          to_email: emailTo.trim(),
+          customer_name: to.name || 'Valued Customer',
+          shop_name: from.name || 'Our Business',
+          invoice_number: invoice.number || '',
+          total_amount: fmt(total),
+          message: emailMsg.trim() || 'Please find your invoice attached.',
+          pdf_base64: pdfBase64,
+        },
+        YOUR_PUBLIC_KEY
+      );
+
+      if (attachmentDropped) {
+        setToast({
+          type: 'error',
+          text: '⚠️ Email sent, but PDF was too large to attach (>50 KB limit). Consider downloading it separately.',
+        });
+      } else {
+        setToast({ type: 'success', text: `✅ Invoice sent successfully to ${emailTo.trim()}!` });
+      }
+      setShowEmailModal(false);
+    } catch (err) {
+      console.error('EmailJS error:', err);
+      setToast({ type: 'error', text: `❌ Failed to send email: ${err?.text || err?.message || 'Unknown error'}` });
+    } finally {
+      setEmailLoading(false);
+    }
+  };
+
+
+  // ── Reset handler (also clears cash input) ─────────────────────────────────
+  const handleReset = () => {
+    setCashGiven('');
+    onChange({
+      from: { name: '', tagline: '', address: '', city: '', phone: '', email: '', gst: '', upi: '', bank: '' },
+      to: { name: '', address: '', city: '', phone: '', gst: '', email: '' },
+      invoice: { number: 'INV-0001', date: new Date().toISOString().slice(0, 10), dueDate: '', terms: 'Net 30', po: '' },
+      items: [defaultItem()],
+      tax: '18',
+      discount: '0',
+      notes: '',
+      currency: '₹',
+    });
+  };
+
   return (
     <div>
+      {/* ─── TOAST ─── */}
+      {toast && (
+        <div className={`toast-notification ${toast.type}`} role="alert">
+          {toast.text}
+          <button className="toast-close" onClick={() => setToast(null)} aria-label="Dismiss">✕</button>
+        </div>
+      )}
+
+      {/* ─── EMAIL MODAL ─── */}
+      {showEmailModal && (
+        <div className="email-modal-overlay" onClick={() => !emailLoading && setShowEmailModal(false)}>
+          <div className="email-modal" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Send Invoice">
+            <div className="email-modal-header">
+              <span className="email-modal-title">📧 Send Invoice via Email</span>
+              <button className="email-modal-close" onClick={() => !emailLoading && setShowEmailModal(false)} disabled={emailLoading} aria-label="Close">✕</button>
+            </div>
+
+            <div className="email-modal-body">
+              <div className="form-group">
+                <label className="form-label">Recipient Email <span>*</span></label>
+                <input
+                  type="email"
+                  value={emailTo}
+                  onChange={e => setEmailTo(e.target.value)}
+                  placeholder="customer@example.com"
+                  disabled={emailLoading}
+                  autoFocus
+                />
+              </div>
+              <div className="form-group" style={{ marginTop: '0.75rem' }}>
+                <label className="form-label">Optional Message</label>
+                <textarea
+                  value={emailMsg}
+                  onChange={e => setEmailMsg(e.target.value)}
+                  placeholder="Hi, please find your invoice attached. Thank you for your business!"
+                  rows={3}
+                  disabled={emailLoading}
+                  style={{ minHeight: '80px' }}
+                />
+              </div>
+              <div className="email-modal-hint">
+                📎 The invoice will be attached as a PDF automatically.
+              </div>
+            </div>
+
+            <div className="email-modal-footer">
+              <button
+                className="btn btn-outline"
+                onClick={() => setShowEmailModal(false)}
+                disabled={emailLoading}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-email"
+                onClick={handleSendEmail}
+                disabled={emailLoading}
+              >
+                {emailLoading
+                  ? <><span className="spinner" /> Sending…</>
+                  : '📧 Send Invoice'
+                }
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ─── INVOICE DETAILS ─── */}
       <div className="form-section">
         <div className="section-label">📋 Invoice Details</div>
@@ -149,6 +354,15 @@ const InvoiceForm = ({ data, onChange }) => {
               <input value={to.phone} onChange={e => update('to', 'phone', e.target.value)} placeholder="+91 99999 11111" />
             </div>
             <div className="form-group">
+              <label className="form-label">Customer Email</label>
+              <input
+                type="email"
+                value={to.email || ''}
+                onChange={e => update('to', 'email', e.target.value)}
+                placeholder="customer@example.com"
+              />
+            </div>
+            <div className="form-group">
               <label className="form-label">GST No. (if applicable)</label>
               <input value={to.gst} onChange={e => update('to', 'gst', e.target.value)} placeholder="Customer GST" />
             </div>
@@ -199,7 +413,7 @@ const InvoiceForm = ({ data, onChange }) => {
 
       {/* ─── TAX & TOTALS ─── */}
       <div className="form-section">
-        <div className="section-label">🧾 Tax & Totals</div>
+        <div className="section-label">🧾 Tax &amp; Totals</div>
         <div className="form-grid form-grid-2" style={{ marginBottom: '0.75rem' }}>
           <div className="form-group">
             <label className="form-label">Tax / GST Rate (%)</label>
@@ -248,11 +462,42 @@ const InvoiceForm = ({ data, onChange }) => {
             <div className="tax-value highlight">{fmt(total)}</div>
           </div>
         </div>
+
+        {/* ─── CASH TENDERED PANEL ─── */}
+        <div className="cash-panel">
+          <div className="cash-panel-title">💵 Cash Tendered / Change</div>
+          <div className="cash-panel-body">
+            <div className="cash-input-group">
+              <label className="form-label" htmlFor="cash-given-input">
+                Cash Given by Customer&nbsp;<span className="cash-currency">({currency})</span>
+              </label>
+              <div className="cash-input-row">
+                <span className="cash-symbol">{currency}</span>
+                <input
+                  id="cash-given-input"
+                  ref={cashInputRef}
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={cashGiven}
+                  onChange={e => setCashGiven(e.target.value)}
+                  placeholder="0.00"
+                  className="cash-input"
+                />
+              </div>
+            </div>
+            {cashStatus && (
+              <div className={`cash-result ${cashStatus.ok ? 'cash-ok' : 'cash-short'}`}>
+                {cashStatus.text}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* ─── NOTES ─── */}
       <div className="form-section">
-        <div className="section-label">📝 Notes & Terms</div>
+        <div className="section-label">📝 Notes &amp; Terms</div>
         <textarea
           value={notes}
           onChange={e => updateRoot('notes', e.target.value)}
@@ -261,7 +506,7 @@ const InvoiceForm = ({ data, onChange }) => {
         />
       </div>
 
-      {/* ─── DOWNLOAD ─── */}
+      {/* ─── ACTIONS ─── */}
       <div className="actions-bar">
         <button
           className="btn btn-cyan"
@@ -273,22 +518,20 @@ const InvoiceForm = ({ data, onChange }) => {
             setPdfLoading(false);
           }}
         >
-          {pdfLoading ? '⏳ Generating PDF...' : '⬇️ Download Invoice PDF'}
+          {pdfLoading ? '⏳ Generating PDF…' : '⬇️ Download Invoice PDF'}
         </button>
+
+        <button
+          className="btn btn-email-action"
+          onClick={openEmailModal}
+          title="Send invoice to customer email"
+        >
+          📧 Send to Email
+        </button>
+
         <button
           className="btn btn-outline"
-          onClick={() => {
-            onChange({
-              from: { name: '', tagline: '', address: '', city: '', phone: '', email: '', gst: '', upi: '', bank: '' },
-              to: { name: '', address: '', city: '', phone: '', gst: '' },
-              invoice: { number: 'INV-0001', date: new Date().toISOString().slice(0,10), dueDate: '', terms: 'Net 30', po: '' },
-              items: [defaultItem()],
-              tax: '18',
-              discount: '0',
-              notes: '',
-              currency: '₹',
-            });
-          }}
+          onClick={handleReset}
         >
           🔄 Reset
         </button>
