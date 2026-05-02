@@ -87,14 +87,13 @@ const InvoiceForm = ({ data, onChange }) => {
 
   // ── Send Invoice via EmailJS ───────────────────────────────────────────────
   // EmailJS free plan cap: ~50 KB per message.
-  // Strategy: generate a compressed PDF, check size, compress harder if needed,
-  // and omit the attachment (sending details only) if it still won't fit.
-  const EMAILJS_BYTE_LIMIT = 45000; // conservative 45 KB to stay safely under 50 KB
+  // Strategy: generate a compressed PDF with multiple aggressive passes.
+  const EMAILJS_BYTE_LIMIT = 40000; // conservative 40 KB to stay safely under 50 KB
 
-  const buildPdfBase64 = async (scale, quality) => {
+  const buildPdfBase64 = async (scale, quality, margin) => {
     const element = document.getElementById('invoice-print-area');
     const opt = {
-      margin: 4,
+      margin,
       image: { type: 'jpeg', quality },
       html2canvas: { scale, useCORS: true, letterRendering: true },
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
@@ -117,18 +116,27 @@ const InvoiceForm = ({ data, onChange }) => {
 
     setEmailLoading(true);
     try {
-      // Pass 1: moderate compression (scale 1, quality 0.6)
-      let pdfBase64 = await buildPdfBase64(1, 0.6);
-      let sizeBytes = Math.ceil((pdfBase64.length * 3) / 4);
+      // Compression passes from least to most aggressive
+      const compressionPasses = [
+        { scale: 1, quality: 0.5, margin: 3 },      // Pass 1: moderate
+        { scale: 0.8, quality: 0.35, margin: 2 },   // Pass 2: heavy
+        { scale: 0.7, quality: 0.25, margin: 2 },   // Pass 3: very heavy
+        { scale: 0.6, quality: 0.15, margin: 1 },   // Pass 4: extreme
+      ];
+
+      let pdfBase64 = '';
+      let sizeBytes = 0;
       let attachmentDropped = false;
 
-      // Pass 2: heavy compression (scale 0.75, quality 0.4)
-      if (sizeBytes > EMAILJS_BYTE_LIMIT) {
-        pdfBase64 = await buildPdfBase64(0.75, 0.4);
+      for (const pass of compressionPasses) {
+        pdfBase64 = await buildPdfBase64(pass.scale, pass.quality, pass.margin);
         sizeBytes = Math.ceil((pdfBase64.length * 3) / 4);
+        if (sizeBytes <= EMAILJS_BYTE_LIMIT) {
+          break;
+        }
       }
 
-      // If still too large, send without attachment
+      // If still too large after all passes, send without attachment
       if (sizeBytes > EMAILJS_BYTE_LIMIT) {
         pdfBase64 = '';
         attachmentDropped = true;
